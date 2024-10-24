@@ -9,7 +9,9 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.net.wifi.ScanResult
 import android.net.wifi.WifiManager
+import android.os.Build
 import android.os.Bundle
+import android.util.Log
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -18,20 +20,27 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
 
+
 class MainActivity : AppCompatActivity() {
     private lateinit var wifiManager: WifiManager
     private lateinit var recyclerView: RecyclerView
     private lateinit var wifiAdapter: WifiNetworkAdapter
     private lateinit var swipeRefreshLayout: SwipeRefreshLayout
     private val wifiList = mutableListOf<ScanResult>()
+    private var isReceiverRegistered = false
 
     private val wifiScanReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val success = intent.getBooleanExtra(WifiManager.EXTRA_RESULTS_UPDATED, false)
+            Log.d(TAG, "Scan results received. Success: $success")
+
             if (success) {
                 scanSuccess()
             } else {
-                scanFailure()
+                Log.d(TAG, "Scan failed, attempting retry after delay")
+                recyclerView.postDelayed({
+                    startWifiScan()
+                }, 1000)
             }
             swipeRefreshLayout.isRefreshing = false
         }
@@ -42,9 +51,83 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+
         setupRecyclerView()
         setupSwipeRefresh()
-        checkPermissionAndStartScan()
+        requestPermissions()
+    }
+
+    private fun requestPermissions() {
+        val permissions = mutableListOf<String>()
+
+        // Location permissions are required for WiFi scanning
+        permissions.add(Manifest.permission.ACCESS_FINE_LOCATION)
+        permissions.add(Manifest.permission.ACCESS_COARSE_LOCATION)
+
+        // Add NEARBY_WIFI_DEVICES permission for Android 13+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
+        }
+
+        // Add WiFi specific permissions
+        permissions.add(Manifest.permission.ACCESS_WIFI_STATE)
+        permissions.add(Manifest.permission.CHANGE_WIFI_STATE)
+
+        val missingPermissions = permissions.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (missingPermissions.isNotEmpty()) {
+            Log.d(TAG, "Requesting permissions: $missingPermissions")
+            ActivityCompat.requestPermissions(
+                this,
+                missingPermissions.toTypedArray(),
+                PERMISSION_REQUEST_CODE
+            )
+        } else {
+            initializeWifiScanning()
+        }
+    }
+
+    private fun hasRequiredPermissions(): Boolean {
+        val hasLocationPermission = ContextCompat.checkSelfPermission(
+            this,
+            Manifest.permission.ACCESS_FINE_LOCATION
+        ) == PackageManager.PERMISSION_GRANTED
+
+        val hasWifiPermission = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(
+                this,
+                Manifest.permission.NEARBY_WIFI_DEVICES
+            ) == PackageManager.PERMISSION_GRANTED
+        } else {
+            true
+        }
+
+        return hasLocationPermission && hasWifiPermission
+    }
+
+    private fun initializeWifiScanning() {
+        if (!wifiManager.isWifiEnabled) {
+            Log.d(TAG, "WiFi is disabled")
+            Toast.makeText(this, "Please enable WiFi in settings", Toast.LENGTH_LONG).show()
+            startActivity(Intent(android.provider.Settings.ACTION_WIFI_SETTINGS))
+            return
+        }
+
+        registerWifiReceiver()
+        startWifiScan()
+    }
+
+    private fun registerWifiReceiver() {
+        if (!isReceiverRegistered) {
+            val intentFilter = IntentFilter().apply {
+                addAction(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION)
+            }
+            registerReceiver(wifiScanReceiver, intentFilter)
+            isReceiverRegistered = true
+            Log.d(TAG, "WiFi receiver registered")
+        }
     }
 
     private fun setupRecyclerView() {
@@ -59,80 +142,87 @@ class MainActivity : AppCompatActivity() {
     private fun setupSwipeRefresh() {
         swipeRefreshLayout = findViewById(R.id.swipeRefreshLayout)
         swipeRefreshLayout.setOnRefreshListener {
-            startWifiScan()
-        }
-    }
-
-    private fun checkPermissionAndStartScan() {
-        val permissions = arrayOf(
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION
-        )
-
-        if (permissions.all { permission ->
-                ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
-            }) {
-            startWifiScan()
-        } else {
-            ActivityCompat.requestPermissions(this, permissions, PERMISSION_REQUEST_CODE)
+            if (hasRequiredPermissions()) {
+                startWifiScan()
+            } else {
+                requestPermissions()
+                swipeRefreshLayout.isRefreshing = false
+            }
         }
     }
 
     private fun startWifiScan() {
-        registerReceiver(
-            wifiScanReceiver,
-            IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION)
-        )
-
-        if (!wifiManager.isWifiEnabled) {
-            Toast.makeText(this, "Please enable WiFi", Toast.LENGTH_LONG).show()
-            swipeRefreshLayout.isRefreshing = false
+        if (!hasRequiredPermissions()) {
+            Log.d(TAG, "Missing required permissions")
+            Toast.makeText(this, "Location permission is required for WiFi scanning", Toast.LENGTH_LONG).show()
+            requestPermissions()
             return
         }
 
-        wifiManager.startScan()
+        try {
+            val success = wifiManager.startScan()
+            Log.d(TAG, "StartScan called. Success: $success")
+
+            if (!success) {
+                Log.d(TAG, "Start scan failed, attempting to get cached results")
+                scanFailure()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error starting WiFi scan", e)
+            Toast.makeText(this, "Error starting WiFi scan: ${e.message}", Toast.LENGTH_LONG).show()
+            swipeRefreshLayout.isRefreshing = false
+        }
     }
 
     private fun scanSuccess() {
-        wifiList.clear()
-        if (ActivityCompat.checkSelfPermission(
-                this,
-                Manifest.permission.ACCESS_FINE_LOCATION
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            // TODO: Consider calling
-            //    ActivityCompat#requestPermissions
-            // here to request the missing permissions, and then overriding
-            //   public void onRequestPermissionsResult(int requestCode, String[] permissions,
-            //                                          int[] grantResults)
-            // to handle the case where the user grants the permission. See the documentation
-            // for ActivityCompat#requestPermissions for more details.
+        if (!hasRequiredPermissions()) {
+            Log.d(TAG, "Cannot access scan results - missing permissions")
+            Toast.makeText(this, "Location permission required to show WiFi networks", Toast.LENGTH_LONG).show()
             return
         }
-        wifiList.addAll(wifiManager.scanResults)
-        wifiAdapter.notifyDataSetChanged()
+
+        try {
+            val results = wifiManager.scanResults
+            Log.d(TAG, "Scan successful. Found ${results.size} networks")
+            results.forEach { result ->
+                Log.d(TAG, "Network found: ${result.SSID}, Signal: ${result.level} dBm")
+            }
+
+            wifiList.clear()
+            wifiList.addAll(results)
+            wifiAdapter.notifyDataSetChanged()
+
+            if (wifiList.isEmpty()) {
+                Log.d(TAG, "No networks found in scan results")
+                Toast.makeText(this, "No WiFi networks found", Toast.LENGTH_SHORT).show()
+            }
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Security exception while accessing scan results", e)
+            Toast.makeText(this, "Permission required to access WiFi scan results", Toast.LENGTH_LONG).show()
+            requestPermissions()
+        }
     }
 
     private fun scanFailure() {
-        // Use cached results if available
-        wifiList.clear()
-        if (ActivityCompat.checkSelfPermission(
-                this,
-                Manifest.permission.ACCESS_FINE_LOCATION
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            // TODO: Consider calling
-            //    ActivityCompat#requestPermissions
-            // here to request the missing permissions, and then overriding
-            //   public void onRequestPermissionsResult(int requestCode, String[] permissions,
-            //                                          int[] grantResults)
-            // to handle the case where the user grants the permission. See the documentation
-            // for ActivityCompat#requestPermissions for more details.
+        if (!hasRequiredPermissions()) {
+            Log.d(TAG, "Cannot access cached results - missing permissions")
+            Toast.makeText(this, "Location permission required to show WiFi networks", Toast.LENGTH_LONG).show()
             return
         }
-        wifiList.addAll(wifiManager.scanResults)
-        wifiAdapter.notifyDataSetChanged()
-        Toast.makeText(this, "Scan failed. Showing cached results.", Toast.LENGTH_SHORT).show()
+
+        try {
+            val results = wifiManager.scanResults
+            Log.d(TAG, "Using cached results. Found ${results.size} networks")
+
+            wifiList.clear()
+            wifiList.addAll(results)
+            wifiAdapter.notifyDataSetChanged()
+            Toast.makeText(this, "Showing cached results.", Toast.LENGTH_SHORT).show()
+        } catch (e: SecurityException) {
+            Log.e(TAG, "Security exception while accessing cached results", e)
+            Toast.makeText(this, "Permission required to access WiFi scan results", Toast.LENGTH_LONG).show()
+            requestPermissions()
+        }
     }
 
     override fun onRequestPermissionsResult(
@@ -143,23 +233,34 @@ class MainActivity : AppCompatActivity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == PERMISSION_REQUEST_CODE) {
             if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
-                startWifiScan()
+                Log.d(TAG, "All permissions granted")
+                initializeWifiScanning()
             } else {
-                Toast.makeText(this, "Permissions required to scan WiFi networks", Toast.LENGTH_LONG).show()
+                Log.d(TAG, "Some permissions were denied")
+                Toast.makeText(
+                    this,
+                    "Location permission is required for WiFi scanning",
+                    Toast.LENGTH_LONG
+                ).show()
             }
         }
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        try {
-            unregisterReceiver(wifiScanReceiver)
-        } catch (e: IllegalArgumentException) {
-            // Receiver not registered
+        if (isReceiverRegistered) {
+            try {
+                unregisterReceiver(wifiScanReceiver)
+                isReceiverRegistered = false
+                Log.d(TAG, "WiFi receiver unregistered")
+            } catch (e: IllegalArgumentException) {
+                Log.e(TAG, "Error unregistering receiver", e)
+            }
         }
     }
 
     companion object {
+        private const val TAG = "WiFiScanner"
         private const val PERMISSION_REQUEST_CODE = 100
     }
 }
